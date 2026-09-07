@@ -58,6 +58,12 @@ const (
 	socksCmdUDPAssociate = 3
 )
 
+// udpAssociateCommand is the smux-stream handshake command the client sends
+// to open a UDP relay. It must stay in lockstep with the server's
+// udpAssociateCommand ("udp-associate") — there is no shared package between
+// the two, only this wire string and the length-prefixed frame format.
+const udpAssociateCommand = "udp-associate"
+
 // UDP relay framing knobs. Datagrams ride one smux stream ("udp-associate")
 // as length-prefixed frames; a relay read deadline resets when the app's TCP
 // control connection drops so a wedged relay cannot leak a smux stream.
@@ -724,11 +730,20 @@ func (c *Client) tunnel(conn net.Conn, sess *smux.Session, targetAddr string, ta
 	_, _ = io.Copy(conn, stream)
 }
 
+// connectRequest is the JSON command frame opening one smux data stream.
+// It mirrors server.ConnectRequest; both sides must stay in lockstep
+// because the field names are the wire protocol.
+type connectRequest struct {
+	Cmd  string `json:"cmd"`
+	Addr string `json:"addr,omitempty"`
+	Port int    `json:"port,omitempty"`
+}
+
 func (c *Client) sendConnectRequest(stream *smux.Stream, targetAddr string, targetPort int) error {
-	connectReq, err := json.Marshal(map[string]any{
-		"cmd":  "connect",
-		"addr": targetAddr,
-		"port": targetPort,
+	connectReq, err := json.Marshal(connectRequest{
+		Cmd:  "connect",
+		Addr: targetAddr,
+		Port: targetPort,
 	})
 	if err != nil {
 		return fmt.Errorf("sid=%d marshal connect req: %w", stream.ID(), err)
@@ -833,7 +848,7 @@ func (c *Client) serveUDPAssociate(tcpConn net.Conn, sess *smux.Session) {
 // sendUDPAssociateRequest opens the relay handshake on a fresh smux stream:
 // one JSON frame {cmd:"udp-associate"} then a 1-byte ack (0x00 = ready).
 func sendUDPAssociateRequest(stream *smux.Stream) error {
-	req, err := json.Marshal(ConnectRequest{Cmd: udpAssociateCommand})
+	req, err := json.Marshal(connectRequest{Cmd: udpAssociateCommand})
 	if err != nil {
 		return fmt.Errorf("marshal udp-associate req: %w", err)
 	}
