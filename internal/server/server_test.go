@@ -170,13 +170,8 @@ func TestServeUDPAssociateRelaysDatagram(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenStream() error = %v", err)
 	}
-	req, err := json.Marshal(ConnectRequest{Cmd: udpAssociateCommand})
-	if err != nil {
-		t.Fatalf("Marshal() error = %v", err)
-	}
-	if _, err := stream.Write(req); err != nil {
-		t.Fatalf("Write() error = %v", err)
-	}
+	// serveUDPAssociate is entered after handleStream consumed the connect
+	// request, so the test goes straight to reading the ack, then frames.
 	ack := make([]byte, 1)
 	_ = stream.SetReadDeadline(time.Now().Add(10 * time.Second))
 	if _, err := io.ReadFull(stream, ack); err != nil || ack[0] != 0x00 {
