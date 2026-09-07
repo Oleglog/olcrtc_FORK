@@ -463,6 +463,76 @@ func TestUDPRelayFrameRoundTrip(t *testing.T) {
 	if _, _, _, err := readUDPRelayFrame(bytes.NewReader([]byte{0, 0, 0, 99, 1})); err == nil {
 		t.Fatal("readUDPRelayFrame() unexpectedly accepted a bad frame")
 	}
+
+	// Zero-payload frames are keepalives and must round-trip cleanly.
+	ka, kb := net.Pipe()
+	defer func() {
+		_ = ka.Close()
+		_ = kb.Close()
+	}()
+	go func() { _ = writeUDPRelayFrame(ka, "", 0, nil) }()
+	kaAddr, kaPort, kaPayload, err := readUDPRelayFrame(kb)
+	if err != nil {
+		t.Fatalf("readUDPRelayFrame(keepalive) error = %v", err)
+	}
+	if kaAddr != "" || kaPort != 0 || len(kaPayload) != 0 {
+		t.Fatalf("keepalive frame = (%q, %d, %v)", kaAddr, kaPort, kaPayload)
+	}
+}
+
+// TestSocksUDPDatagramCodecRoundTrip pins the RFC 1928 datagram header the
+// relay shares with Xray's socks outbound: Xray writes every datagram as
+// [RSV RSV FRAG][ATYP][addr][port][data] and expects replies in the same
+// shape. The relay must decode the destination from inside the datagram
+// (not the packet source) and re-encode responses with the remote address.
+func TestSocksUDPDatagramCodecRoundTrip(t *testing.T) {
+	// IPv4 destination, as Xray emits for resolved A records.
+	dg := encodeSocksUDPDatagram("192.0.2.10", 443, []byte{9, 8, 7})
+	addr, port, payload, err := decodeSocksUDPDatagram(dg)
+	if err != nil {
+		t.Fatalf("decodeSocksUDPDatagram() error = %v", err)
+	}
+	if addr != "192.0.2.10" || port != 443 || !bytes.Equal(payload, []byte{9, 8, 7}) {
+		t.Fatalf("ipv4 codec = (%q, %d, %v)", addr, port, payload)
+	}
+	if dg[0] != 0 || dg[1] != 0 || dg[2] != 0 {
+		t.Fatalf("ipv4 datagram RSV/FRAG = %v", dg[:3])
+	}
+	if dg[3] != socksAtypIPv4 {
+		t.Fatalf("ipv4 datagram ATYP = %d, want %d", dg[3], socksAtypIPv4)
+	}
+
+	// IPv6 destination, as Xray emits for AAAA records.
+	dg6 := encodeSocksUDPDatagram("2001:db8::1", 53, []byte{1})
+	addr6, port6, payload6, err := decodeSocksUDPDatagram(dg6)
+	if err != nil {
+		t.Fatalf("decodeSocksUDPDatagram(ipv6) error = %v", err)
+	}
+	if addr6 != "2001:db8::1" || port6 != 53 || !bytes.Equal(payload6, []byte{1}) {
+		t.Fatalf("ipv6 codec = (%q, %d, %v)", addr6, port6, payload6)
+	}
+
+	// A Xray-shaped datagram with a domain destination decodes too.
+	domain := append([]byte{0, 0, 0, socksAtypDomain, 11}, []byte("example.com")...)
+	domain = append(domain, 0, 53, 7)
+	addrD, portD, payloadD, err := decodeSocksUDPDatagram(domain)
+	if err != nil {
+		t.Fatalf("decodeSocksUDPDatagram(domain) error = %v", err)
+	}
+	if addrD != "example.com" || portD != 53 || !bytes.Equal(payloadD, []byte{7}) {
+		t.Fatalf("domain codec = (%q, %d, %v)", addrD, portD, payloadD)
+	}
+
+	// Fragmented datagrams are refused, matching Xray's own behaviour.
+	frag := append([]byte{0, 0, 2, socksAtypIPv4, 1, 2, 3, 4, 0, 53}, []byte("x")...)
+	if _, _, _, err := decodeSocksUDPDatagram(frag); err == nil {
+		t.Fatal("decodeSocksUDPDatagram() unexpectedly accepted a fragmented datagram")
+	}
+
+	// Truncated datagrams are refused.
+	if _, _, _, err := decodeSocksUDPDatagram([]byte{0, 0, 0, socksAtypIPv4}); err == nil {
+		t.Fatal("decodeSocksUDPDatagram() unexpectedly accepted a truncated datagram")
+	}
 }
 
 func TestSocksAssociateReplyAdvertisesLoopback(t *testing.T) {

@@ -58,6 +58,14 @@ const (
 	socksCmdUDPAssociate = 3
 )
 
+// SOCKS5 address types (RFC 1928, section 4.5) used by the UDP datagram
+// codec below.
+const (
+	socksAtypIPv4   = 1
+	socksAtypDomain = 3
+	socksAtypIPv6   = 4
+)
+
 // udpAssociateCommand is the smux-stream handshake command the client sends
 // to open a UDP relay. It must stay in lockstep with the server's
 // udpAssociateCommand ("udp-associate") — there is no shared package between
@@ -67,10 +75,13 @@ const udpAssociateCommand = "udp-associate"
 // UDP relay framing knobs. Datagrams ride one smux stream ("udp-associate")
 // as length-prefixed frames; a relay read deadline resets when the app's TCP
 // control connection drops so a wedged relay cannot leak a smux stream.
+// Keepalive frames (zero payload) are sent during silence so the server's
+// 5-minute stream deadline cannot expire mid-call.
 const (
 	udpRelayFrameCap     = 64 * 1024
 	udpRelayReadTimeout  = 2 * time.Minute
 	udpRelayWriteTimeout = 30 * time.Second
+	udpKeepaliveInterval = 30 * time.Second
 )
 
 // Client handles local SOCKS5 connections and tunnels them to the server.
@@ -833,13 +844,55 @@ func (c *Client) serveUDPAssociate(tcpConn net.Conn, sess *smux.Session) {
 	done := make(chan struct{})
 	var once sync.Once
 	finish := func() { once.Do(func() { close(done) }) }
+	// Xray's socks outbound uses one UDP socket per UDP session, so the
+	// first app datagram latches the peer; every response is addressed back
+	// to it (RFC 1928 keeps the destination inside each datagram instead).
+	// writeMu serializes frame writes across the pumps and the keepalive:
+	// smux splits large Writes into multiple wire frames, so interleaved
+	// writers would corrupt the framing.
+	peerCh := make(chan *net.UDPAddr, 1)
+	writeMu := &sync.Mutex{}
+	writeFrame := func(addr string, port int, payload []byte) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		_ = stream.SetWriteDeadline(time.Now().Add(udpRelayWriteTimeout))
+		return writeUDPRelayFrame(stream, addr, port, payload)
+	}
 	go func() {
 		buf := make([]byte, 1)
 		_, _ = tcpConn.Read(buf)
 		finish()
 	}()
-	go udpStreamToPackets(stream, pc, finish)
-	go udpPacketsToStream(pc, stream, done)
+	go udpPacketsToStream(pc, stream, done, peerCh, writeFrame)
+	go func() {
+		select {
+		case <-done:
+			return
+		case peer := <-peerCh:
+			udpStreamToPackets(stream, pc, peer, finish)
+		}
+	}()
+	// Zero-payload frames keep the server's stream deadline from expiring
+	// while the app is silent (muted call, idle QUIC session).
+	keepaliveStop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(udpKeepaliveInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-keepaliveStop:
+				return
+			case <-ticker.C:
+				if err := writeFrame("", 0, nil); err != nil {
+					finish()
+					return
+				}
+			}
+		}
+	}()
+	defer close(keepaliveStop)
 	<-done
 	_ = pc.Close()
 	_ = stream.Close()
@@ -867,9 +920,11 @@ func sendUDPAssociateRequest(stream *smux.Stream) error {
 }
 
 // udpStreamToPackets decodes length-prefixed frames from the smux stream and
-// sends each as one UDP datagram. A frame is [2-byte big-endian addrLen]
-// [SOCKS5 addr...] [2-byte big-endian port] [payload].
-func udpStreamToPackets(stream *smux.Stream, pc net.PacketConn, onDone func()) {
+// sends each as one UDP datagram back to the app-side peer. Response frames
+// from the server are wrapped in a SOCKS5 UDP header (encodeSocksUDPDatagram)
+// because the peer is Xray's socks outbound, which expects every datagram it
+// reads to carry the RFC 1928 [RSV RSV FRAG][addr][port] prefix.
+func udpStreamToPackets(stream *smux.Stream, pc net.PacketConn, peer *net.UDPAddr, onDone func()) {
 	defer onDone()
 	for {
 		_ = stream.SetReadDeadline(time.Now().Add(udpRelayReadTimeout))
@@ -877,17 +932,34 @@ func udpStreamToPackets(stream *smux.Stream, pc net.PacketConn, onDone func()) {
 		if err != nil {
 			return
 		}
+		if len(payload) == 0 {
+			// Zero-payload frames are server keepalives; they reset the read
+			// deadline but must not reach the app as datagrams.
+			continue
+		}
+		datagram := encodeSocksUDPDatagram(addr, port, payload)
 		_ = pc.SetWriteDeadline(time.Now().Add(udpRelayWriteTimeout))
-		if _, err := pc.WriteTo(payload, &net.UDPAddr{IP: net.ParseIP(addr), Port: port}); err != nil {
+		if _, err := pc.WriteTo(datagram, peer); err != nil {
 			return
 		}
 	}
 }
 
-// udpPacketsToStream wraps each inbound datagram in a relay frame and ships
-// it over the smux stream. Stops when the control connection drops.
-func udpPacketsToStream(pc net.PacketConn, stream *smux.Stream, done <-chan struct{}) {
+// udpPacketsToStream decodes each inbound datagram's SOCKS5 UDP header
+// (decodeSocksUDPDatagram) to recover the real destination, then ships the
+// payload as a relay frame. Xray's socks outbound writes every datagram as
+// [RSV RSV FRAG][ATYP][addr][port][data]; the destination lives inside the
+// datagram, not in the packet's source address. The first datagram also
+// latches the app-side peer so responses can be addressed back to it.
+func udpPacketsToStream(
+	pc net.PacketConn,
+	stream *smux.Stream,
+	done <-chan struct{},
+	peerCh chan<- *net.UDPAddr,
+	writeFrame func(addr string, port int, payload []byte) error,
+) {
 	buf := make([]byte, udpRelayFrameCap)
+	sentPeer := false
 	for {
 		_ = pc.SetReadDeadline(time.Now().Add(udpRelayReadTimeout))
 		n, src, err := pc.ReadFrom(buf)
@@ -903,11 +975,94 @@ func udpPacketsToStream(pc net.PacketConn, stream *smux.Stream, done <-chan stru
 		if !ok {
 			continue
 		}
-		_ = stream.SetWriteDeadline(time.Now().Add(udpRelayWriteTimeout))
-		if err := writeUDPRelayFrame(stream, udpAddr.IP.String(), udpAddr.Port, buf[:n]); err != nil {
+		if !sentPeer {
+			sentPeer = true
+			select {
+			case peerCh <- udpAddr:
+			default:
+			}
+		}
+		addr, port, payload, err := decodeSocksUDPDatagram(buf[:n])
+		if err != nil {
+			logger.Debugf("udp-associate datagram decode failed: %v", err)
+			continue
+		}
+		if err := writeFrame(addr, port, payload); err != nil {
 			return
 		}
 	}
+}
+
+// encodeSocksUDPDatagram wraps one relay payload in the RFC 1928 UDP header
+// with the remote address, mirroring the format Xray's socks UDPReader
+// decodes. IPv4 and IPv6 use ATYP 1/4, hostnames are never emitted because
+// relay frames carry resolved IPs only.
+func encodeSocksUDPDatagram(addr string, port int, payload []byte) []byte {
+	out := make([]byte, 0, 3+net.IPv4len+2+len(payload)+2)
+	out = append(out, 0, 0, 0) // RSV RSV FRAG=0 (no fragmentation)
+	var portBuf [2]byte
+	binary.BigEndian.PutUint16(portBuf[:], uint16(port)) //nolint:gosec // G115: port range fits u16
+	if ip := net.ParseIP(addr); ip != nil {
+		if v4 := ip.To4(); v4 != nil {
+			out = append(out, socksAtypIPv4)
+			out = append(out, v4...)
+		} else {
+			out = append(out, socksAtypIPv6)
+			out = append(out, ip.To16()...)
+		}
+	} else {
+		// Unparseable relay address: fall back to a zero IPv4 header so the
+		// datagram stays decodable; Xray will drop it as a bad destination.
+		out = append(out, socksAtypIPv4, 0, 0, 0, 0)
+	}
+	out = append(out, portBuf[:]...)
+	return append(out, payload...)
+}
+
+// decodeSocksUDPDatagram parses the RFC 1928 UDP header from one app-side
+// datagram, returning the destination address, port and payload. Fragmented
+// datagrams (FRAG != 0) are rejected: nothing in the stack fragments and
+// reassembly is out of scope for the relay.
+func decodeSocksUDPDatagram(datagram []byte) (string, int, []byte, error) {
+	if len(datagram) < 4 {
+		return "", 0, nil, ErrUnsupportedAddressType
+	}
+	if datagram[2] != 0 {
+		return "", 0, nil, fmt.Errorf("fragmented udp datagram (frag=%d)", datagram[2])
+	}
+	off := 3
+	var addr string
+	switch atyp := datagram[off]; atyp {
+	case socksAtypIPv4:
+		if len(datagram) < off+1+net.IPv4len+2 {
+			return "", 0, nil, ErrUnsupportedAddressType
+		}
+		addr = net.IP(datagram[off+1 : off+1+net.IPv4len]).String()
+		off += 1 + net.IPv4len
+	case socksAtypDomain:
+		if len(datagram) < off+2 {
+			return "", 0, nil, ErrUnsupportedAddressType
+		}
+		nameLen := int(datagram[off+1])
+		if len(datagram) < off+2+nameLen+2 {
+			return "", 0, nil, ErrUnsupportedAddressType
+		}
+		addr = string(datagram[off+2 : off+2+nameLen])
+		off += 2 + nameLen
+	case socksAtypIPv6:
+		if len(datagram) < off+1+net.IPv6len+2 {
+			return "", 0, nil, ErrUnsupportedAddressType
+		}
+		addr = net.IP(datagram[off+1 : off+1+net.IPv6len]).String()
+		off += 1 + net.IPv6len
+	default:
+		return "", 0, nil, fmt.Errorf("%w: atyp=%d", ErrUnsupportedAddressType, atyp)
+	}
+	if len(datagram) < off+2 {
+		return "", 0, nil, ErrUnsupportedAddressType
+	}
+	port := int(binary.BigEndian.Uint16(datagram[off : off+2])) //nolint:gosec // G115: port range fits u16
+	return addr, port, datagram[off+2:], nil
 }
 
 // writeUDPRelayFrame encodes one datagram: [u16 addrLen][addr][u16 port][payload].

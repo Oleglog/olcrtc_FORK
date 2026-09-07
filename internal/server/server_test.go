@@ -205,6 +205,93 @@ func TestServeUDPAssociateRelaysDatagram(t *testing.T) {
 	<-done
 }
 
+// TestServeUDPAssociateStreamsMultipleReplies proves the NAT table holds a
+// persistent socket per destination: one client datagram triggers two server
+// replies (echo target sends twice). The old one-shot relay could return at
+// most one reply per datagram, which cannot carry RTP/QUIC streams.
+func TestServeUDPAssociateStreamsMultipleReplies(t *testing.T) {
+	// Echo target that answers each datagram twice.
+	echo, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer func() { _ = echo.Close() }()
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, src, err := echo.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			_, _ = echo.WriteTo(buf[:n], src)
+			_, _ = echo.WriteTo(buf[:n], src)
+		}
+	}()
+	echoAddr := echo.LocalAddr().(*net.UDPAddr)
+
+	a, b := net.Pipe()
+	defer func() {
+		_ = a.Close()
+		_ = b.Close()
+	}()
+	serverSess, err := smux.Server(a, smuxConfig(0))
+	if err != nil {
+		t.Fatalf("smux.Server() error = %v", err)
+	}
+	defer func() { _ = serverSess.Close() }()
+	clientSess, err := smux.Client(b, smuxConfig(0))
+	if err != nil {
+		t.Fatalf("smux.Client() error = %v", err)
+	}
+	defer func() { _ = clientSess.Close() }()
+
+	done := make(chan struct{})
+	go func() {
+		stream, err := serverSess.AcceptStream()
+		if err == nil {
+			s := &Server{dnsServer: "8.8.8.8:53"}
+			s.setupResolver()
+			s.handleStream(context.Background(), stream, "test-session")
+		}
+		close(done)
+	}()
+
+	stream, err := clientSess.OpenStream()
+	if err != nil {
+		t.Fatalf("OpenStream() error = %v", err)
+	}
+	req, err := json.Marshal(ConnectRequest{Cmd: udpAssociateCommand})
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if _, err := stream.Write(req); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	ack := make([]byte, 1)
+	_ = stream.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if _, err := io.ReadFull(stream, ack); err != nil || ack[0] != 0x00 {
+		t.Fatalf("ack = %v, err = %v", ack, err)
+	}
+	_ = stream.SetReadDeadline(time.Time{})
+
+	payload := []byte{1, 3, 3, 7}
+	if err := writeUDPRelayFrame(stream, "127.0.0.1", echoAddr.Port, payload); err != nil {
+		t.Fatalf("writeUDPRelayFrame() error = %v", err)
+	}
+	_ = stream.SetReadDeadline(time.Now().Add(30 * time.Second))
+	for i := 0; i < 2; i++ {
+		addr, port, reply, err := readUDPRelayFrame(stream)
+		if err != nil {
+			t.Fatalf("reply %d: readUDPRelayFrame() error = %v", i, err)
+		}
+		if addr != "127.0.0.1" || port != echoAddr.Port || !bytes.Equal(reply, payload) {
+			t.Fatalf("reply %d = (%q, %d, %v)", i, addr, port, reply)
+		}
+	}
+	_ = stream.Close()
+	<-done
+}
+
 func TestDefaultAuthHook(t *testing.T) {
 	sid, err := defaultAuthHook("dev", map[string]any{"x": 1})
 	if err != nil {

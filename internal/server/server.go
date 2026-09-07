@@ -1162,58 +1162,186 @@ func (s *Server) dial(req ConnectRequest) (net.Conn, error) {
 // serveUDPAssociate runs the server side of the "udp-associate" relay: one
 // smux stream carries length-prefixed datagram frames (the same framing the
 // client uses in client.writeUDPRelayFrame) until either side closes. Each
-// frame is forwarded as a real UDP datagram to its destination; replies are
-// framed back onto the stream. The relay dials with the instance resolver so
-// tunneled names resolve through the same DNS as TCP traffic.
+// distinct destination gets a persistent connected UDP socket in a small
+// NAT table; a reader goroutine pumps replies from that socket back onto
+// the stream, so multi-packet flows (QUIC, VoIP, games) work — one-shot
+// per-datagram dials could only ever return a single reply. The relay dials
+// with the instance resolver so tunneled names resolve through the same DNS
+// as TCP traffic.
 func (s *Server) serveUDPAssociate(stream *smux.Stream, sessionID string) {
 	defer func() { _ = stream.Close() }()
 	if _, err := stream.Write([]byte{0x00}); err != nil {
 		return
 	}
 	logger.Infof("sid=%d udp-associate opened session=%s", stream.ID(), sessionID)
+	nat := newUDPNatTable(stream, s.resolver, udpNatIdleTimeout)
+	defer nat.closeAll()
+	// Zero-payload frames keep the client's stream read deadline from
+	// expiring during silence (muted call, idle QUIC session).
+	keepaliveStop := make(chan struct{})
+	defer close(keepaliveStop)
+	go func() {
+		ticker := time.NewTicker(udpKeepaliveInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-keepaliveStop:
+				return
+			case <-ticker.C:
+				if err := nat.writeKeepalive(); err != nil {
+					return
+				}
+			}
+		}
+	}()
 	for {
-		_ = stream.SetReadDeadline(time.Now().Add(2 * time.Minute))
+		_ = stream.SetReadDeadline(time.Now().Add(udpRelayStreamTimeout))
 		addr, port, payload, err := readUDPRelayFrame(stream)
 		if err != nil {
 			return
 		}
-		if err := s.relayUDPDatagram(stream, addr, port, payload); err != nil {
+		if len(payload) == 0 {
+			// Zero-payload frames are keepalives the client sends to keep
+			// the stream's read deadline from expiring during silence.
+			continue
+		}
+		if err := nat.send(addr, port, payload); err != nil {
 			logger.Debugf("sid=%d udp-associate relay failed: %v", stream.ID(), err)
+		}
+	}
+}
+
+// udpNatTable maps one relay destination to a persistent connected UDP
+// socket, keyed per smux stream. Readers run per socket and frame replies
+// back onto the stream; idle sockets are reaped by send() so a dead peer
+// cannot leak one socket per datagram. writeMu serializes frame writes:
+// smux splits large Writes into multiple wire frames, so interleaved
+// keepalive and reply writes would corrupt the framing.
+type udpNatTable struct {
+	mu       sync.Mutex
+	writeMu  sync.Mutex
+	stream   *smux.Stream
+	resolver *net.Resolver
+	idle     time.Duration
+	entries  map[string]*udpNatEntry
+}
+
+type udpNatEntry struct {
+	conn *net.UDPConn
+	last time.Time
+}
+
+func newUDPNatTable(stream *smux.Stream, resolver *net.Resolver, idle time.Duration) *udpNatTable {
+	return &udpNatTable{
+		stream:   stream,
+		resolver: resolver,
+		idle:     idle,
+		entries:  make(map[string]*udpNatEntry),
+	}
+}
+
+// writeKeepalive emits one zero-payload relay frame so the client's stream
+// read deadline keeps sliding while the app is silent.
+func (n *udpNatTable) writeKeepalive() error {
+	n.writeMu.Lock()
+	defer n.writeMu.Unlock()
+	_ = n.stream.SetWriteDeadline(time.Now().Add(udpRelayWriteTimeout))
+	return writeUDPRelayFrame(n.stream, "", 0, nil)
+}
+
+// send forwards one datagram to its destination, dialing a persistent socket
+// on first use, and reaps entries idle beyond the table timeout.
+func (n *udpNatTable) send(addr string, port int, payload []byte) error {
+	hostPort := net.JoinHostPort(addr, strconv.Itoa(port))
+	n.mu.Lock()
+	entry, ok := n.entries[hostPort]
+	if ok && time.Since(entry.last) > n.idle {
+		// The reader goroutine timed out or the socket died; redial below.
+		ok = false
+		_ = entry.conn.Close()
+		delete(n.entries, hostPort)
+	}
+	if !ok {
+		ipAddr, err := n.resolver.ResolveIPAddr(context.Background(), "ip", addr)
+		if err != nil {
+			n.mu.Unlock()
+			return fmt.Errorf("resolve %s: %w", addr, err)
+		}
+		udpAddr := &net.UDPAddr{IP: ipAddr.IP, Port: port}
+		conn, err := net.DialUDP("udp", nil, udpAddr)
+		if err != nil {
+			n.mu.Unlock()
+			return fmt.Errorf("udp dial %s: %w", hostPort, err)
+		}
+		entry = &udpNatEntry{conn: conn}
+		n.entries[hostPort] = entry
+		go n.readLoop(entry, udpAddr)
+	}
+	entry.last = time.Now()
+	conn := entry.conn
+	n.mu.Unlock()
+
+	_ = conn.SetWriteDeadline(time.Now().Add(udpRelayWriteTimeout))
+	if _, err := conn.Write(payload); err != nil {
+		// Drop the entry so the next datagram dials a fresh socket instead
+		// of piling onto a broken one.
+		n.mu.Lock()
+		if current, still := n.entries[hostPort]; still && current == entry {
+			_ = entry.conn.Close()
+			delete(n.entries, hostPort)
+		}
+		n.mu.Unlock()
+		return fmt.Errorf("udp write %s: %w", hostPort, err)
+	}
+	return nil
+}
+
+// readLoop pumps replies from one persistent socket back onto the relay
+// stream until the socket is closed by reaping or table teardown.
+func (n *udpNatTable) readLoop(entry *udpNatEntry, udpAddr *net.UDPAddr) {
+	defer func() { _ = entry.conn.Close() }()
+	addr := udpAddr.IP.String()
+	port := udpAddr.Port
+	buf := make([]byte, udpRelayFrameCap)
+	for {
+		_ = entry.conn.SetReadDeadline(time.Now().Add(n.idle))
+		m, err := entry.conn.Read(buf)
+		if err != nil {
+			return
+		}
+		n.writeMu.Lock()
+		_ = n.stream.SetWriteDeadline(time.Now().Add(udpRelayWriteTimeout))
+		err = writeUDPRelayFrame(n.stream, addr, port, buf[:m])
+		n.writeMu.Unlock()
+		if err != nil {
 			return
 		}
 	}
 }
 
-// relayUDPDatagram forwards one client datagram to its UDP destination and
-// writes at most one reply frame back. One-shot per datagram: no session
-// table, so NAT-style multi-packet flows (QUIC, VoIP, games) each pay one
-// dial — acceptable for the first relay cut, and stateless on the server.
-func (s *Server) relayUDPDatagram(stream *smux.Stream, addr string, port int, payload []byte) error {
-	dst := net.JoinHostPort(addr, strconv.Itoa(port))
-	dialer := &net.Dialer{Timeout: 10 * time.Second, Resolver: s.resolver}
-	pc, err := dialer.Dial("udp", dst)
-	if err != nil {
-		return fmt.Errorf("udp dial %s: %w", dst, err)
+func (n *udpNatTable) closeAll() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for key, entry := range n.entries {
+		_ = entry.conn.Close()
+		delete(n.entries, key)
 	}
-	defer func() { _ = pc.Close() }()
-	_ = pc.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	if _, err := pc.Write(payload); err != nil {
-		return fmt.Errorf("udp write %s: %w", dst, err)
-	}
-	_ = pc.SetReadDeadline(time.Now().Add(30 * time.Second))
-	resp := make([]byte, udpRelayFrameCap)
-	n, err := pc.Read(resp)
-	if err != nil {
-		return fmt.Errorf("udp read %s: %w", dst, err)
-	}
-	_ = stream.SetWriteDeadline(time.Now().Add(30 * time.Second))
-	return writeUDPRelayFrame(stream, addr, port, resp[:n])
 }
 
 // udpRelayFrameCap bounds one relay datagram on the wire (payload plus the
 // small address header). Sized for a full-size UDP payload; anything larger
 // is a protocol error, not a datagram we should fragment.
 const udpRelayFrameCap = 64 * 1024
+
+// UDP relay pacing knobs. The stream deadline must exceed the client's
+// keepalive interval (client sends a zero-payload frame every 30 s during
+// silence); NAT sockets idle out well before the table grows unbounded.
+const (
+	udpRelayStreamTimeout = 5 * time.Minute
+	udpRelayWriteTimeout  = 30 * time.Second
+	udpNatIdleTimeout     = 2 * time.Minute
+	udpKeepaliveInterval  = 30 * time.Second
+)
 
 // writeUDPRelayFrame encodes one datagram: [u32 total][u16 addrLen][addr]
 // [u16 port][payload]. Mirrors client.writeUDPRelayFrame; both sides must
