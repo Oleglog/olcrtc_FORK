@@ -89,6 +89,7 @@ type mobileConfig struct {
 	livenessInterval time.Duration
 	livenessTimeout  time.Duration
 	livenessFailures int
+	udpEnabled       bool
 }
 
 // SetProtector sets the Android VPN socket protector.
@@ -156,6 +157,16 @@ func SetVP8Options(fps, batchSize int) {
 	ensureDefaultConfigLocked()
 	defaults.vp8FPS = clampAtLeastOne(fps, 120)
 	defaults.vp8BatchSize = clampAtLeastOne(batchSize, 64)
+}
+
+// SetUDPEnabled toggles the UDP ASSOCIATE relay for Start/Check/Ping.
+// Default off: UDP ASSOCIATE requests are refused (SOCKS 0x07) until the
+// app flips this on after the relay proves itself on device.
+func SetUDPEnabled(enabled bool) {
+	mu.Lock()
+	defer mu.Unlock()
+	ensureDefaultConfigLocked()
+	defaults.udpEnabled = enabled
 }
 
 // SetLivenessOptions configures control-stream ping/pong checks.
@@ -266,6 +277,7 @@ func Check(
 				LocalAddr: fmt.Sprintf("127.0.0.1:%d", socksPort),
 				DNSServer: defaultDNSServer,
 				AuthToken: cfg.authToken,
+				UDPEnabled:  cfg.udpEnabled,
 				TransportOptions: vp8channel.Options{
 					FPS:       clampAtLeastOne(vp8FPS, 120),
 					BatchSize: clampAtLeastOne(vp8BatchSize, 64),
@@ -363,6 +375,7 @@ func Ping(
 				LocalAddr: fmt.Sprintf("127.0.0.1:%d", socksPort),
 				DNSServer: defaultDNSServer,
 				AuthToken: cfg.authToken,
+				UDPEnabled:  cfg.udpEnabled,
 				TransportOptions: vp8channel.Options{
 					FPS:       clampAtLeastOne(vp8FPS, 120),
 					BatchSize: clampAtLeastOne(vp8BatchSize, 64),
@@ -621,6 +634,7 @@ func startWithConfig(
 				LocalAddr: fmt.Sprintf("127.0.0.1:%d", socksPort),
 				DNSServer: cfg.dnsServer,
 				AuthToken: cfg.authToken,
+				UDPEnabled:  cfg.udpEnabled,
 				SOCKSUser: socksUser,
 				SOCKSPass: socksPass,
 				TransportOptions: vp8channel.Options{

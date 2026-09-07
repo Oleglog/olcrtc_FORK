@@ -235,15 +235,17 @@ func TestSocks5RequestIPv4(t *testing.T) {
 	done := make(chan struct {
 		addr string
 		port int
+		udp  bool
 		err  error
 	}, 1)
 	go func() {
-		addr, port, err := c.socks5Request(server)
+		addr, port, udp, err := c.socks5Request(server)
 		done <- struct {
 			addr string
 			port int
+			udp  bool
 			err  error
-		}{addr: addr, port: port, err: err}
+		}{addr: addr, port: port, udp: udp, err: err}
 	}()
 
 	req := []byte{5, 1, 0, 1, 127, 0, 0, 1}
@@ -260,6 +262,9 @@ func TestSocks5RequestIPv4(t *testing.T) {
 	if res.addr != "127.0.0.1" || res.port != 8080 {
 		t.Fatalf("socks5Request() = (%q, %d), want (127.0.0.1, 8080)", res.addr, res.port)
 	}
+	if res.udp {
+		t.Fatal("socks5Request() unexpectedly flagged CONNECT as UDP ASSOCIATE")
+	}
 }
 
 func TestSocks5RequestDomain(t *testing.T) {
@@ -273,15 +278,17 @@ func TestSocks5RequestDomain(t *testing.T) {
 	done := make(chan struct {
 		addr string
 		port int
+		udp  bool
 		err  error
 	}, 1)
 	go func() {
-		addr, port, err := c.socks5Request(server)
+		addr, port, udp, err := c.socks5Request(server)
 		done <- struct {
 			addr string
 			port int
+			udp  bool
 			err  error
-		}{addr: addr, port: port, err: err}
+		}{addr: addr, port: port, udp: udp, err: err}
 	}()
 
 	req := make([]byte, 0, 16)
@@ -300,6 +307,9 @@ func TestSocks5RequestDomain(t *testing.T) {
 	if res.addr != "example.com" || res.port != 443 {
 		t.Fatalf("socks5Request() = (%q, %d), want (example.com, 443)", res.addr, res.port)
 	}
+	if res.udp {
+		t.Fatal("socks5Request() unexpectedly flagged CONNECT as UDP ASSOCIATE")
+	}
 }
 
 func TestSocks5RequestRejectsCommandAndAddressType(t *testing.T) {
@@ -312,7 +322,7 @@ func TestSocks5RequestRejectsCommandAndAddressType(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, _, err := c.socks5Request(server)
+		_, _, _, err := c.socks5Request(server)
 		done <- err
 	}()
 
@@ -332,7 +342,7 @@ func TestSocks5RequestRejectsCommandAndAddressType(t *testing.T) {
 
 	done = make(chan error, 1)
 	go func() {
-		_, _, err := c.socks5Request(server2)
+		_, _, _, err := c.socks5Request(server2)
 		done <- err
 	}()
 
@@ -355,7 +365,7 @@ func TestSocks5RequestReadPortError(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, _, err := c.socks5Request(server)
+		_, _, _, err := c.socks5Request(server)
 		done <- err
 	}()
 
@@ -365,6 +375,112 @@ func TestSocks5RequestReadPortError(t *testing.T) {
 	_ = client.Close()
 	if err := <-done; err == nil {
 		t.Fatal("socks5Request() unexpectedly succeeded")
+	}
+}
+
+func TestSocks5RequestFlagsUDPAssociate(t *testing.T) {
+	c := &Client{}
+	server, client := net.Pipe()
+	defer func() {
+		_ = server.Close()
+		_ = client.Close()
+	}()
+
+	done := make(chan struct {
+		udp bool
+		err error
+	}, 1)
+	go func() {
+		_, _, udp, err := c.socks5Request(server)
+		done <- struct {
+			udp bool
+			err error
+		}{udp: udp, err: err}
+	}()
+
+	// VER=5 CMD=3(UDP ASSOCIATE) RSV=0 ATYP=1 127.0.0.1 port 0.
+	req := []byte{5, 3, 0, 1, 127, 0, 0, 1, 0, 0}
+	if _, err := client.Write(req); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	res := <-done
+	if res.err != nil {
+		t.Fatalf("socks5Request() error = %v", res.err)
+	}
+	if !res.udp {
+		t.Fatal("socks5Request() did not flag UDP ASSOCIATE")
+	}
+}
+
+func TestSocks5AssociateDisabledRepliesNotSupported(t *testing.T) {
+	c := &Client{}
+	server, client := net.Pipe()
+	defer func() {
+		_ = server.Close()
+		_ = client.Close()
+	}()
+
+	done := make(chan struct{}, 1)
+	go func() {
+		c.serveUDPAssociate(server, nil)
+		close(done)
+	}()
+
+	// serveUDPAssociate must answer before reading: gated off by default.
+	resp := make([]byte, 10)
+	if _, err := io.ReadFull(client, resp); err != nil {
+		t.Fatalf("ReadFull() error = %v", err)
+	}
+	if !bytes.Equal(resp, []byte{5, 7, 0, 1, 0, 0, 0, 0, 0, 0}) {
+		t.Fatalf("associate reply = %v, want command-not-supported", resp)
+	}
+	<-done
+}
+
+func TestUDPRelayFrameRoundTrip(t *testing.T) {
+	a, b := net.Pipe()
+	defer func() {
+		_ = a.Close()
+		_ = b.Close()
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- writeUDPRelayFrame(a, "8.8.8.8", 53, []byte{1, 2, 3})
+	}()
+	addr, port, payload, err := readUDPRelayFrame(b)
+	if err != nil {
+		t.Fatalf("readUDPRelayFrame() error = %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("writeUDPRelayFrame() error = %v", err)
+	}
+	if addr != "8.8.8.8" || port != 53 || !bytes.Equal(payload, []byte{1, 2, 3}) {
+		t.Fatalf("frame = (%q, %d, %v)", addr, port, payload)
+	}
+
+	if _, _, _, err := readUDPRelayFrame(bytes.NewReader([]byte{0, 0, 0, 99, 1})); err == nil {
+		t.Fatal("readUDPRelayFrame() unexpectedly accepted a bad frame")
+	}
+}
+
+func TestSocksAssociateReplyAdvertisesLoopback(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer func() { _ = pc.Close() }()
+	reply := socksAssociateReply(pc.LocalAddr())
+	if len(reply) != 10 || reply[0] != 5 || reply[1] != 0 || reply[3] != 1 {
+		t.Fatalf("associate reply = %v", reply)
+	}
+	if !bytes.Equal(reply[4:8], []byte{127, 0, 0, 1}) {
+		t.Fatalf("associate reply addr = %v, want loopback", reply[4:8])
+	}
+	wantPort := pc.LocalAddr().(*net.UDPAddr).Port
+	if got := int(binary.BigEndian.Uint16(reply[8:10])); got != wantPort {
+		t.Fatalf("associate reply port = %d, want %d", got, wantPort)
 	}
 }
 

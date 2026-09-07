@@ -78,12 +78,126 @@ func TestParseConnectRequest(t *testing.T) {
 		t.Fatalf("parseConnectRequest() = %+v", req)
 	}
 
+	udpReq, err := json.Marshal(ConnectRequest{Cmd: udpAssociateCommand})
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if _, ok := parseConnectRequest(udpReq); !ok {
+		t.Fatal("parseConnectRequest() rejected udp-associate")
+	}
+
 	if _, ok := parseConnectRequest([]byte("not-json")); ok {
 		t.Fatal("parseConnectRequest() unexpectedly accepted invalid json")
 	}
 	if _, ok := parseConnectRequest([]byte(`{"cmd":"other"}`)); ok {
 		t.Fatal("parseConnectRequest() unexpectedly accepted wrong command")
 	}
+}
+
+func TestUDPRelayFrameRoundTrip(t *testing.T) {
+	a, b := net.Pipe()
+	defer func() {
+		_ = a.Close()
+		_ = b.Close()
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- writeUDPRelayFrame(a, "8.8.8.8", 53, []byte{1, 2, 3})
+	}()
+	addr, port, payload, err := readUDPRelayFrame(b)
+	if err != nil {
+		t.Fatalf("readUDPRelayFrame() error = %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("writeUDPRelayFrame() error = %v", err)
+	}
+	if addr != "8.8.8.8" || port != 53 || !bytes.Equal(payload, []byte{1, 2, 3}) {
+		t.Fatalf("frame = (%q, %d, %v)", addr, port, payload)
+	}
+
+	if _, _, _, err := readUDPRelayFrame(bytes.NewReader([]byte{0, 0, 0, 99, 1})); err == nil {
+		t.Fatal("readUDPRelayFrame() unexpectedly accepted a bad frame")
+	}
+}
+
+// TestServeUDPAssociateRelaysDatagram runs the full relay against a local UDP
+// echo target over a real smux session: frame in, datagram out, reply back.
+func TestServeUDPAssociateRelaysDatagram(t *testing.T) {
+	echo, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer func() { _ = echo.Close() }()
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, src, err := echo.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			_, _ = echo.WriteTo(buf[:n], src)
+		}
+	}()
+	echoAddr := echo.LocalAddr().(*net.UDPAddr)
+
+	a, b := net.Pipe()
+	defer func() {
+		_ = a.Close()
+		_ = b.Close()
+	}()
+	serverSess, err := smux.Server(a, smuxConfig(0))
+	if err != nil {
+		t.Fatalf("smux.Server() error = %v", err)
+	}
+	defer func() { _ = serverSess.Close() }()
+	clientSess, err := smux.Client(b, smuxConfig(0))
+	if err != nil {
+		t.Fatalf("smux.Client() error = %v", err)
+	}
+	defer func() { _ = clientSess.Close() }()
+
+	done := make(chan struct{})
+	go func() {
+		stream, err := serverSess.AcceptStream()
+		if err == nil {
+			(&Server{}).serveUDPAssociate(stream, "test-session")
+		}
+		close(done)
+	}()
+
+	stream, err := clientSess.OpenStream()
+	if err != nil {
+		t.Fatalf("OpenStream() error = %v", err)
+	}
+	req, err := json.Marshal(ConnectRequest{Cmd: udpAssociateCommand})
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if _, err := stream.Write(req); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	ack := make([]byte, 1)
+	_ = stream.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if _, err := io.ReadFull(stream, ack); err != nil || ack[0] != 0x00 {
+		t.Fatalf("ack = %v, err = %v", ack, err)
+	}
+	_ = stream.SetReadDeadline(time.Time{})
+
+	payload := []byte{9, 8, 7, 6}
+	if err := writeUDPRelayFrame(stream, "127.0.0.1", echoAddr.Port, payload); err != nil {
+		t.Fatalf("writeUDPRelayFrame() error = %v", err)
+	}
+	_ = stream.SetReadDeadline(time.Now().Add(30 * time.Second))
+	addr, port, reply, err := readUDPRelayFrame(stream)
+	if err != nil {
+		t.Fatalf("readUDPRelayFrame() error = %v", err)
+	}
+	if addr != "127.0.0.1" || port != echoAddr.Port || !bytes.Equal(reply, payload) {
+		t.Fatalf("echo = (%q, %d, %v)", addr, port, reply)
+	}
+	_ = stream.Close()
+	<-done
 }
 
 func TestDefaultAuthHook(t *testing.T) {

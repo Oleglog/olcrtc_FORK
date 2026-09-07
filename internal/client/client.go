@@ -47,6 +47,24 @@ var (
 	ErrSOCKSAuthFailed = errors.New("SOCKS5 authentication failed")
 	// ErrSOCKSCredTooLong is returned when a SOCKS5 username or password exceeds 255 bytes.
 	ErrSOCKSCredTooLong = errors.New("socks5 user/pass exceeds 255 bytes")
+	// ErrUDPDisabled is returned for UDP ASSOCIATE when the server was built
+	// without relay support (UDPEnabled=false on the mobile API).
+	ErrUDPDisabled = errors.New("udp relay is disabled")
+)
+
+// SOCKS5 command codes (RFC 1928, section 4).
+const (
+	socksCmdConnect      = 1
+	socksCmdUDPAssociate = 3
+)
+
+// UDP relay framing knobs. Datagrams ride one smux stream ("udp-associate")
+// as length-prefixed frames; a relay read deadline resets when the app's TCP
+// control connection drops so a wedged relay cannot leak a smux stream.
+const (
+	udpRelayFrameCap     = 64 * 1024
+	udpRelayReadTimeout  = 2 * time.Minute
+	udpRelayWriteTimeout = 30 * time.Second
 )
 
 // Client handles local SOCKS5 connections and tunnels them to the server.
@@ -66,6 +84,7 @@ type Client struct {
 	dnsServer   string
 	socksUser   string
 	socksPass   string
+	udpEnabled  bool
 }
 
 // HealthFunc is called when the client control health snapshot changes.
@@ -83,6 +102,10 @@ type Config struct {
 	Insecure         bool
 	SOCKSUser        string
 	SOCKSPass        string
+	// UDPEnabled gates UDP ASSOCIATE: when false, UDP ASSOCIATE requests are
+	// refused with ErrUDPDisabled (SOCKS reply 0x07). Default off until the
+	// relay proves itself on device; flip via the app's UDP toggle.
+	UDPEnabled       bool
 	TransportOptions transport.Options
 	Engine           string
 	URL              string
@@ -129,13 +152,14 @@ func RunWithReady(ctx context.Context, cfg Config, onReady func()) error {
 	}
 
 	c := &Client{
-		cipher:    cipher,
-		deviceID:  deviceID,
-		claims:    cfg.Claims,
-		dnsServer: cfg.DNSServer,
-		socksUser: cfg.SOCKSUser,
-		socksPass: cfg.SOCKSPass,
-		health:    runtime.NewHealthTracker(cfg.OnHealth),
+		cipher:     cipher,
+		deviceID:   deviceID,
+		claims:     cfg.Claims,
+		dnsServer:  cfg.DNSServer,
+		socksUser:  cfg.SOCKSUser,
+		socksPass:  cfg.SOCKSPass,
+		udpEnabled: cfg.UDPEnabled,
+		health:     runtime.NewHealthTracker(cfg.OnHealth),
 	}
 
 	// shutdown is registered BEFORE bringUpLink so we always close any
@@ -652,7 +676,7 @@ func (c *Client) handleSocks5(_ context.Context, conn net.Conn) {
 		return
 	}
 
-	targetAddr, targetPort, err := c.socks5Request(conn)
+	targetAddr, targetPort, udpAssociate, err := c.socks5Request(conn)
 	if err != nil {
 		return
 	}
@@ -665,6 +689,10 @@ func (c *Client) handleSocks5(_ context.Context, conn net.Conn) {
 		return
 	}
 
+	if udpAssociate {
+		c.serveUDPAssociate(conn, sess)
+		return
+	}
 	c.tunnel(conn, sess, targetAddr, targetPort)
 }
 
@@ -751,6 +779,167 @@ func (c *Client) socks5Handshake(conn net.Conn) error {
 	return nil
 }
 
+// serveUDPAssociate implements RFC 1928 UDP ASSOCIATE over the tunnel: it
+// opens one smux stream ("udp-associate"), binds a loopback UDP socket, and
+// shuttles datagrams between the app and the server. The app's TCP control
+// connection stays open for the relay lifetime; when it drops, the UDP
+// socket closes and the smux stream is released.
+func (c *Client) serveUDPAssociate(tcpConn net.Conn, sess *smux.Session) {
+	if !c.udpEnabled {
+		_, _ = tcpConn.Write(replyCommandNotSupported())
+		return
+	}
+	stream, err := sess.OpenStream()
+	if err != nil {
+		logger.Warnf("udp-associate OpenStream failed: %v", err)
+		_, _ = tcpConn.Write(replyHostUnreachable())
+		return
+	}
+	if err := sendUDPAssociateRequest(stream); err != nil {
+		logger.Warnf("udp-associate handshake failed: %v", err)
+		_ = stream.Close()
+		_, _ = tcpConn.Write(replyHostUnreachable())
+		return
+	}
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		logger.Warnf("udp-associate listen failed: %v", err)
+		_ = stream.Close()
+		_, _ = tcpConn.Write(replyHostUnreachable())
+		return
+	}
+	relayAddr := pc.LocalAddr()
+	logger.Infof("udp-associate relay on %s", relayAddr)
+	if _, err := tcpConn.Write(socksAssociateReply(relayAddr)); err != nil {
+		_ = pc.Close()
+		_ = stream.Close()
+		return
+	}
+	done := make(chan struct{})
+	var once sync.Once
+	finish := func() { once.Do(func() { close(done) }) }
+	go func() {
+		buf := make([]byte, 1)
+		_, _ = tcpConn.Read(buf)
+		finish()
+	}()
+	go udpStreamToPackets(stream, pc, finish)
+	go udpPacketsToStream(pc, stream, done)
+	<-done
+	_ = pc.Close()
+	_ = stream.Close()
+}
+
+// sendUDPAssociateRequest opens the relay handshake on a fresh smux stream:
+// one JSON frame {cmd:"udp-associate"} then a 1-byte ack (0x00 = ready).
+func sendUDPAssociateRequest(stream *smux.Stream) error {
+	req, err := json.Marshal(ConnectRequest{Cmd: udpAssociateCommand})
+	if err != nil {
+		return fmt.Errorf("marshal udp-associate req: %w", err)
+	}
+	_ = stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if _, err := stream.Write(req); err != nil {
+		return fmt.Errorf("write udp-associate req: %w", err)
+	}
+	_ = stream.SetWriteDeadline(time.Time{})
+	ack := make([]byte, 1)
+	_ = stream.SetReadDeadline(time.Now().Add(runtime.ConnectAckTimeout(nil)))
+	if _, err := io.ReadFull(stream, ack); err != nil || ack[0] != 0x00 {
+		return fmt.Errorf("%w (read_err=%v ack=%v)", ErrRemoteNotReady, err, ack)
+	}
+	_ = stream.SetReadDeadline(time.Time{})
+	return nil
+}
+
+// udpStreamToPackets decodes length-prefixed frames from the smux stream and
+// sends each as one UDP datagram. A frame is [2-byte big-endian addrLen]
+// [SOCKS5 addr...] [2-byte big-endian port] [payload].
+func udpStreamToPackets(stream *smux.Stream, pc net.PacketConn, onDone func()) {
+	defer onDone()
+	for {
+		_ = stream.SetReadDeadline(time.Now().Add(udpRelayReadTimeout))
+		addr, port, payload, err := readUDPRelayFrame(stream)
+		if err != nil {
+			return
+		}
+		_ = pc.SetWriteDeadline(time.Now().Add(udpRelayWriteTimeout))
+		if _, err := pc.WriteTo(payload, &net.UDPAddr{IP: net.ParseIP(addr), Port: port}); err != nil {
+			return
+		}
+	}
+}
+
+// udpPacketsToStream wraps each inbound datagram in a relay frame and ships
+// it over the smux stream. Stops when the control connection drops.
+func udpPacketsToStream(pc net.PacketConn, stream *smux.Stream, done <-chan struct{}) {
+	buf := make([]byte, udpRelayFrameCap)
+	for {
+		_ = pc.SetReadDeadline(time.Now().Add(udpRelayReadTimeout))
+		n, src, err := pc.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		select {
+		case <-done:
+			return
+		default:
+		}
+		udpAddr, ok := src.(*net.UDPAddr)
+		if !ok {
+			continue
+		}
+		_ = stream.SetWriteDeadline(time.Now().Add(udpRelayWriteTimeout))
+		if err := writeUDPRelayFrame(stream, udpAddr.IP.String(), udpAddr.Port, buf[:n]); err != nil {
+			return
+		}
+	}
+}
+
+// writeUDPRelayFrame encodes one datagram: [u16 addrLen][addr][u16 port][payload].
+func writeUDPRelayFrame(w io.Writer, addr string, port int, payload []byte) error {
+	frame := make([]byte, 0, 4+len(addr)+len(payload))
+	var lenBuf [2]byte
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(addr))) //nolint:gosec // G115: loopback datagrams, bounded by frame cap
+	frame = append(frame, lenBuf[:]...)
+	frame = append(frame, []byte(addr)...)
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(port)) //nolint:gosec // G115: port range fits u16
+	frame = append(frame, lenBuf[:]...)
+	frame = append(frame, payload...)
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(frame))) //nolint:gosec // G115: bounded by construction
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(frame)
+	return err
+}
+
+// readUDPRelayFrame decodes one frame written by writeUDPRelayFrame.
+func readUDPRelayFrame(r io.Reader) (string, int, []byte, error) {
+	var hdr [4]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return "", 0, nil, err
+	}
+	size := binary.BigEndian.Uint32(hdr[:])
+	if size < 4 || size > udpRelayFrameCap {
+		return "", 0, nil, fmt.Errorf("bad udp relay frame size %d", size)
+	}
+	body := make([]byte, size)
+	if _, err := io.ReadFull(r, body); err != nil {
+		return "", 0, nil, err
+	}
+	if len(body) < 4 {
+		return "", 0, nil, fmt.Errorf("truncated udp relay frame")
+	}
+	addrLen := int(binary.BigEndian.Uint16(body[:2]))
+	if 2+addrLen+2 > len(body) {
+		return "", 0, nil, fmt.Errorf("truncated udp relay address")
+	}
+	addr := string(body[2 : 2+addrLen])
+	port := int(binary.BigEndian.Uint16(body[2+addrLen : 2+addrLen+2]))
+	return addr, port, body[2+addrLen+2:], nil
+}
+
 func (c *Client) socks5UserPassAuth(conn net.Conn) error {
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(conn, header); err != nil {
@@ -787,27 +976,27 @@ func (c *Client) socks5UserPassAuth(conn net.Conn) error {
 	return nil
 }
 
-func (c *Client) socks5Request(conn net.Conn) (string, int, error) {
+func (c *Client) socks5Request(conn net.Conn) (string, int, bool, error) {
 	header := make([]byte, 4)
 	if _, err := io.ReadFull(conn, header); err != nil {
-		return "", 0, fmt.Errorf("read socks5 request: %w", err)
+		return "", 0, false, fmt.Errorf("read socks5 request: %w", err)
 	}
-	if header[1] != 1 {
-		return "", 0, fmt.Errorf("%w: %d", ErrUnsupportedSOCKSCommand, header[1])
+	if header[1] != socksCmdConnect && header[1] != socksCmdUDPAssociate {
+		return "", 0, false, fmt.Errorf("%w: %d", ErrUnsupportedSOCKSCommand, header[1])
 	}
 
 	addr, err := c.readSocks5Addr(conn, header[3])
 	if err != nil {
-		return "", 0, err
+		return "", 0, false, err
 	}
 
 	portBuf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, portBuf); err != nil {
-		return "", 0, fmt.Errorf("read socks5 port: %w", err)
+		return "", 0, false, fmt.Errorf("read socks5 port: %w", err)
 	}
 	port := int(binary.BigEndian.Uint16(portBuf))
 
-	return addr, port, nil
+	return addr, port, header[1] == socksCmdUDPAssociate, nil
 }
 
 func (c *Client) readSocks5Addr(conn net.Conn, addrType byte) (string, error) {
@@ -833,10 +1022,37 @@ func (c *Client) readSocks5Addr(conn net.Conn, addrType byte) (string, error) {
 	}
 }
 
+// socksAssociateReply builds the UDP ASSOCIATE success reply advertising the
+// loopback relay endpoint (BND.ADDR/BND.PORT per RFC 1928 section 4).
+func socksAssociateReply(relay net.Addr) []byte {
+	host, port := "127.0.0.1", 0
+	if udp, ok := relay.(*net.UDPAddr); ok {
+		if ip := udp.IP; ip != nil && ip.To4() != nil {
+			host = ip.String()
+		}
+		port = udp.Port
+	}
+	ip := net.ParseIP(host).To4()
+	if ip == nil {
+		ip = net.IPv4(127, 0, 0, 1).To4()
+	}
+	var portBuf [2]byte
+	binary.BigEndian.PutUint16(portBuf[:], uint16(port)) //nolint:gosec // G115: port range fits u16
+	reply := []byte{5, 0, 0, 1}
+	reply = append(reply, ip...)
+	return append(reply, portBuf[:]...)
+}
+
 func replySuccess() []byte {
 	return []byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}
 }
 
 func replyHostUnreachable() []byte {
 	return []byte{5, 4, 0, 1, 0, 0, 0, 0, 0, 0}
+}
+
+// replyCommandNotSupported answers 0x07 (command not supported) for gated
+// requests such as UDP ASSOCIATE with the relay disabled.
+func replyCommandNotSupported() []byte {
+	return []byte{5, 7, 0, 1, 0, 0, 0, 0, 0, 0}
 }

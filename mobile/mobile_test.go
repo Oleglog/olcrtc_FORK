@@ -89,6 +89,7 @@ func TestDefaultsAndSetters(t *testing.T) {
 	SetDNS("9.9.9.9:53")
 	SetVP8Options(-1, 999)
 	SetLivenessOptions(2500, 750, -1)
+	SetUDPEnabled(true)
 
 	mu.Lock()
 	got := defaults
@@ -96,9 +97,10 @@ func TestDefaultsAndSetters(t *testing.T) {
 	if got.transport != dataTransport || got.dnsServer != "9.9.9.9:53" ||
 		got.vp8FPS != 1 || got.vp8BatchSize != 64 ||
 		got.livenessInterval != 2500*time.Millisecond || got.livenessTimeout != 750*time.Millisecond ||
-		got.livenessFailures != control.DefaultFailures {
+		got.livenessFailures != control.DefaultFailures || !got.udpEnabled {
 		t.Fatalf("defaults = %+v", got)
 	}
+	SetUDPEnabled(false)
 
 	SetDebug(true)
 	if !logger.IsVerbose() {

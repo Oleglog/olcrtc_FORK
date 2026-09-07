@@ -3,6 +3,7 @@ package server
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,11 @@ import (
 )
 
 const connectCommand = "connect"
+
+// udpAssociateCommand opens a UDP relay stream: datagrams ride smux as
+// length-prefixed frames (see client.writeUDPRelayFrame), one frame per
+// datagram, until either side closes the stream.
+const udpAssociateCommand = "udp-associate"
 
 var (
 	// ErrKeyRequired re-exports runtime.ErrKeyRequired for compatibility with
@@ -1033,6 +1039,10 @@ func (s *Server) handleStream(_ context.Context, stream *smux.Stream, sessionID 
 			header = append(header, tmp[:n]...)
 			if req, ok := parseConnectRequest(header); ok {
 				_ = stream.SetReadDeadline(time.Time{})
+				if req.Cmd == udpAssociateCommand {
+					s.serveUDPAssociate(stream, sessionID)
+					return
+				}
 				s.dispatch(stream, req, sessionID)
 				return
 			}
@@ -1051,7 +1061,7 @@ func parseConnectRequest(buf []byte) (ConnectRequest, bool) {
 	if err := json.Unmarshal(buf, &req); err != nil {
 		return req, false
 	}
-	if req.Cmd != connectCommand {
+	if req.Cmd != connectCommand && req.Cmd != udpAssociateCommand {
 		return req, false
 	}
 	return req, true
@@ -1147,6 +1157,109 @@ func (s *Server) dial(req ConnectRequest) (net.Conn, error) {
 		return nil, err
 	}
 	return conn, nil
+}
+
+// serveUDPAssociate runs the server side of the "udp-associate" relay: one
+// smux stream carries length-prefixed datagram frames (the same framing the
+// client uses in client.writeUDPRelayFrame) until either side closes. Each
+// frame is forwarded as a real UDP datagram to its destination; replies are
+// framed back onto the stream. The relay dials with the instance resolver so
+// tunneled names resolve through the same DNS as TCP traffic.
+func (s *Server) serveUDPAssociate(stream *smux.Stream, sessionID string) {
+	defer func() { _ = stream.Close() }()
+	if _, err := stream.Write([]byte{0x00}); err != nil {
+		return
+	}
+	logger.Infof("sid=%d udp-associate opened session=%s", stream.ID(), sessionID)
+	for {
+		_ = stream.SetReadDeadline(time.Now().Add(2 * time.Minute))
+		addr, port, payload, err := readUDPRelayFrame(stream)
+		if err != nil {
+			return
+		}
+		if err := s.relayUDPDatagram(stream, addr, port, payload); err != nil {
+			logger.Debugf("sid=%d udp-associate relay failed: %v", stream.ID(), err)
+			return
+		}
+	}
+}
+
+// relayUDPDatagram forwards one client datagram to its UDP destination and
+// writes at most one reply frame back. One-shot per datagram: no session
+// table, so NAT-style multi-packet flows (QUIC, VoIP, games) each pay one
+// dial — acceptable for the first relay cut, and stateless on the server.
+func (s *Server) relayUDPDatagram(stream *smux.Stream, addr string, port int, payload []byte) error {
+	dst := net.JoinHostPort(addr, strconv.Itoa(port))
+	dialer := &net.Dialer{Timeout: 10 * time.Second, Resolver: s.resolver}
+	pc, err := dialer.Dial("udp", dst)
+	if err != nil {
+		return fmt.Errorf("udp dial %s: %w", dst, err)
+	}
+	defer func() { _ = pc.Close() }()
+	_ = pc.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if _, err := pc.Write(payload); err != nil {
+		return fmt.Errorf("udp write %s: %w", dst, err)
+	}
+	_ = pc.SetReadDeadline(time.Now().Add(30 * time.Second))
+	resp := make([]byte, udpRelayFrameCap)
+	n, err := pc.Read(resp)
+	if err != nil {
+		return fmt.Errorf("udp read %s: %w", dst, err)
+	}
+	_ = stream.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	return writeUDPRelayFrame(stream, addr, port, resp[:n])
+}
+
+// udpRelayFrameCap bounds one relay datagram on the wire (payload plus the
+// small address header). Sized for a full-size UDP payload; anything larger
+// is a protocol error, not a datagram we should fragment.
+const udpRelayFrameCap = 64 * 1024
+
+// writeUDPRelayFrame encodes one datagram: [u32 total][u16 addrLen][addr]
+// [u16 port][payload]. Mirrors client.writeUDPRelayFrame; both sides must
+// stay in lockstep because there is no version byte on this sub-protocol.
+func writeUDPRelayFrame(w io.Writer, addr string, port int, payload []byte) error {
+	frame := make([]byte, 0, 4+len(addr)+len(payload))
+	var lenBuf [2]byte
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(addr))) //nolint:gosec // G115: datagram addr, bounded by frame cap
+	frame = append(frame, lenBuf[:]...)
+	frame = append(frame, []byte(addr)...)
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(port)) //nolint:gosec // G115: port range fits u16
+	frame = append(frame, lenBuf[:]...)
+	frame = append(frame, payload...)
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(frame))) //nolint:gosec // G115: bounded by construction
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(frame)
+	return err
+}
+
+// readUDPRelayFrame decodes one frame written by writeUDPRelayFrame.
+func readUDPRelayFrame(r io.Reader) (string, int, []byte, error) {
+	var hdr [4]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return "", 0, nil, err
+	}
+	size := binary.BigEndian.Uint32(hdr[:])
+	if size < 4 || size > udpRelayFrameCap {
+		return "", 0, nil, fmt.Errorf("bad udp relay frame size %d", size)
+	}
+	body := make([]byte, size)
+	if _, err := io.ReadFull(r, body); err != nil {
+		return "", 0, nil, err
+	}
+	if len(body) < 4 {
+		return "", 0, nil, fmt.Errorf("truncated udp relay frame")
+	}
+	addrLen := int(binary.BigEndian.Uint16(body[:2]))
+	if 2+addrLen+2 > len(body) {
+		return "", 0, nil, fmt.Errorf("truncated udp relay address")
+	}
+	addr := string(body[2 : 2+addrLen])
+	port := int(binary.BigEndian.Uint16(body[2+addrLen : 2+addrLen+2]))
+	return addr, port, body[2+addrLen+2:], nil
 }
 
 func (s *Server) socks5Connect(conn net.Conn, targetAddr string, targetPort int) error {

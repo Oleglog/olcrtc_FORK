@@ -629,6 +629,19 @@ func (p *streamTransport) writerLoop() {
 		select {
 		case <-p.closeCh:
 			return
+		case frame := <-p.outbound:
+			// Data path: never wait for the next tick when KCP already has
+			// bytes queued. Coalescing back-to-back frames here only adds up
+			// to one frameInterval of latency per message for zero wire
+			// savings — the batcher drains the queue non-blockingly below.
+			ticksSinceKeepalive++
+			if ticksSinceKeepalive >= forceKeepaliveEvery {
+				ticksSinceKeepalive = 0
+				hdr := p.epochHeader()
+				p.writeTrackSample(hdr[:])
+			}
+			p.writeTrackSample(p.batchSample(frame, p.perTickBytes))
+			idleTicks = 0
 		case <-ticker.C:
 			ticksSinceKeepalive++
 			if ticksSinceKeepalive >= forceKeepaliveEvery {
