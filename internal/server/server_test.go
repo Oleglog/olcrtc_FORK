@@ -161,7 +161,12 @@ func TestServeUDPAssociateRelaysDatagram(t *testing.T) {
 	go func() {
 		stream, err := serverSess.AcceptStream()
 		if err == nil {
-			(&Server{}).serveUDPAssociate(stream, "test-session")
+			// Production path: handleStream consumes the connect frame and
+			// routes udp-associate to serveUDPAssociate. A real DNS server
+			// address keeps the resolver usable for the echo target.
+			s := &Server{dnsServer: "8.8.8.8:53"}
+			s.setupResolver()
+			s.handleStream(context.Background(), stream, "test-session")
 		}
 		close(done)
 	}()
@@ -170,8 +175,13 @@ func TestServeUDPAssociateRelaysDatagram(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenStream() error = %v", err)
 	}
-	// serveUDPAssociate is entered after handleStream consumed the connect
-	// request, so the test goes straight to reading the ack, then frames.
+	req, err := json.Marshal(ConnectRequest{Cmd: udpAssociateCommand})
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if _, err := stream.Write(req); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
 	ack := make([]byte, 1)
 	_ = stream.SetReadDeadline(time.Now().Add(10 * time.Second))
 	if _, err := io.ReadFull(stream, ack); err != nil || ack[0] != 0x00 {
