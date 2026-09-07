@@ -1262,12 +1262,14 @@ func (n *udpNatTable) send(addr string, port int, payload []byte) error {
 		delete(n.entries, hostPort)
 	}
 	if !ok {
-		ipAddr, err := n.resolver.ResolveIPAddr(context.Background(), "ip", addr)
-		if err != nil {
+		// Resolve through the instance DNS (same path as TCP traffic) so
+		// domain destinations from the SOCKS5 header work.
+		ips, err := n.resolver.LookupIP(context.Background(), "ip", addr)
+		if err != nil || len(ips) == 0 {
 			n.mu.Unlock()
-			return fmt.Errorf("resolve %s: %w", addr, err)
+			return fmt.Errorf("resolve %s: %v", addr, err)
 		}
-		udpAddr := &net.UDPAddr{IP: ipAddr.IP, Port: port}
+		udpAddr := &net.UDPAddr{IP: ips[0], Port: port}
 		conn, err := net.DialUDP("udp", nil, udpAddr)
 		if err != nil {
 			n.mu.Unlock()
