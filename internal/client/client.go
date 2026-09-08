@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -841,6 +842,11 @@ func (c *Client) serveUDPAssociate(tcpConn net.Conn, sess *smux.Session) {
 		_ = stream.Close()
 		return
 	}
+	var txPackets, rxPackets atomic.Uint64
+	defer func() {
+		logger.Infof("udp-associate session finished on %s: tx=%d pkts, rx=%d pkts",
+			relayAddr, txPackets.Load(), rxPackets.Load())
+	}()
 	done := make(chan struct{})
 	var once sync.Once
 	finish := func() { once.Do(func() { close(done) }) }
@@ -863,13 +869,13 @@ func (c *Client) serveUDPAssociate(tcpConn net.Conn, sess *smux.Session) {
 		_, _ = tcpConn.Read(buf)
 		finish()
 	}()
-	go udpPacketsToStream(pc, stream, done, peerCh, writeFrame)
+	go udpPacketsToStream(pc, stream, done, peerCh, writeFrame, &txPackets)
 	go func() {
 		select {
 		case <-done:
 			return
 		case peer := <-peerCh:
-			udpStreamToPackets(stream, pc, peer, finish)
+			udpStreamToPackets(stream, pc, peer, finish, &rxPackets)
 		}
 	}()
 	// Zero-payload frames keep the server's stream deadline from expiring
@@ -924,7 +930,7 @@ func sendUDPAssociateRequest(stream *smux.Stream) error {
 // from the server are wrapped in a SOCKS5 UDP header (encodeSocksUDPDatagram)
 // because the peer is Xray's socks outbound, which expects every datagram it
 // reads to carry the RFC 1928 [RSV RSV FRAG][addr][port] prefix.
-func udpStreamToPackets(stream *smux.Stream, pc net.PacketConn, peer *net.UDPAddr, onDone func()) {
+func udpStreamToPackets(stream *smux.Stream, pc net.PacketConn, peer *net.UDPAddr, onDone func(), rxPackets *atomic.Uint64) {
 	defer onDone()
 	for {
 		_ = stream.SetReadDeadline(time.Now().Add(udpRelayReadTimeout))
@@ -942,6 +948,7 @@ func udpStreamToPackets(stream *smux.Stream, pc net.PacketConn, peer *net.UDPAdd
 		if _, err := pc.WriteTo(datagram, peer); err != nil {
 			return
 		}
+		rxPackets.Add(1)
 	}
 }
 
@@ -957,6 +964,7 @@ func udpPacketsToStream(
 	done <-chan struct{},
 	peerCh chan<- *net.UDPAddr,
 	writeFrame func(addr string, port int, payload []byte) error,
+	txPackets *atomic.Uint64,
 ) {
 	buf := make([]byte, udpRelayFrameCap)
 	sentPeer := false
@@ -990,6 +998,7 @@ func udpPacketsToStream(
 		if err := writeFrame(addr, port, payload); err != nil {
 			return
 		}
+		txPackets.Add(1)
 	}
 }
 

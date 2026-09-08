@@ -1224,6 +1224,7 @@ type udpNatTable struct {
 	resolver *net.Resolver
 	idle     time.Duration
 	entries  map[string]*udpNatEntry
+	closed   bool
 }
 
 type udpNatEntry struct {
@@ -1250,10 +1251,15 @@ func (n *udpNatTable) writeKeepalive() error {
 }
 
 // send forwards one datagram to its destination, dialing a persistent socket
-// on first use, and reaps entries idle beyond the table timeout.
+// on first use, and reaps entries idle beyond the table timeout. DNS lookup
+// and socket dial run outside table locks so slow queries do not stall other destinations.
 func (n *udpNatTable) send(addr string, port int, payload []byte) error {
 	hostPort := net.JoinHostPort(addr, strconv.Itoa(port))
 	n.mu.Lock()
+	if n.closed {
+		n.mu.Unlock()
+		return net.ErrClosed
+	}
 	entry, ok := n.entries[hostPort]
 	if ok && time.Since(entry.last) > n.idle {
 		// The reader goroutine timed out or the socket died; redial below.
@@ -1262,22 +1268,43 @@ func (n *udpNatTable) send(addr string, port int, payload []byte) error {
 		delete(n.entries, hostPort)
 	}
 	if !ok {
-		// Resolve through the instance DNS (same path as TCP traffic) so
-		// domain destinations from the SOCKS5 header work.
-		ips, err := n.resolver.LookupIP(context.Background(), "ip", addr)
-		if err != nil || len(ips) == 0 {
-			n.mu.Unlock()
-			return fmt.Errorf("resolve %s: %v", addr, err)
+		n.mu.Unlock()
+
+		// Resolve IP without holding table mutex: parse fast if already an IP,
+		// otherwise resolve through instance DNS.
+		var targetIP net.IP
+		if ip := net.ParseIP(addr); ip != nil {
+			targetIP = ip
+		} else {
+			ips, err := n.resolver.LookupIP(context.Background(), "ip", addr)
+			if err != nil || len(ips) == 0 {
+				return fmt.Errorf("resolve %s: %v", addr, err)
+			}
+			targetIP = ips[0]
 		}
-		udpAddr := &net.UDPAddr{IP: ips[0], Port: port}
+		udpAddr := &net.UDPAddr{IP: targetIP, Port: port}
 		conn, err := net.DialUDP("udp", nil, udpAddr)
 		if err != nil {
-			n.mu.Unlock()
 			return fmt.Errorf("udp dial %s: %w", hostPort, err)
 		}
-		entry = &udpNatEntry{conn: conn}
-		n.entries[hostPort] = entry
-		go n.readLoop(entry, udpAddr)
+
+		n.mu.Lock()
+		if n.closed {
+			_ = conn.Close()
+			n.mu.Unlock()
+			return net.ErrClosed
+		}
+		if existing, still := n.entries[hostPort]; still && time.Since(existing.last) <= n.idle {
+			_ = conn.Close()
+			entry = existing
+		} else {
+			if still {
+				_ = existing.conn.Close()
+			}
+			entry = &udpNatEntry{conn: conn}
+			n.entries[hostPort] = entry
+			go n.readLoop(entry, udpAddr)
+		}
 	}
 	entry.last = time.Now()
 	conn := entry.conn
@@ -1324,6 +1351,7 @@ func (n *udpNatTable) readLoop(entry *udpNatEntry, udpAddr *net.UDPAddr) {
 func (n *udpNatTable) closeAll() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	n.closed = true
 	for key, entry := range n.entries {
 		_ = entry.conn.Close()
 		delete(n.entries, key)
